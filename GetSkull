@@ -1,0 +1,366 @@
+#!/bin/bash
+#
+
+
+Usage() {
+cat << EOF
+
+    Usage: $0 <rootdir> [tempdir] [refdir]
+
+        <rootdir> specifies the path to the main directory with the data of one animal.
+        Intermediate files will be stored in the <tempdir> subdirectory (default: proc).
+
+        This routine uses the INIA19 template (http://www.nitrc.org/projects/inia19/).
+        <refdir> should specify the root path to these files.
+
+EOF
+exit 1
+}
+
+###########################################################
+## Check input arguments
+
+if [ $# -lt 1 ]
+then
+    Usage
+else
+    cNHP=$1
+fi
+
+if [ $# -gt 1 ]
+    cwdir=$2
+else
+    cwdir="proc"
+fi
+
+if [ $# -gt 2 ]
+    refdir=$3
+else
+    refdir="/DATA/NHP_MRI/templates/inia19"
+
+fi
+
+shift $#
+
+###########################################################
+## Determine reference images
+
+if [ ! -d "$refdir" ]
+then
+    echo "ERROR: Directory with reference images (INIA19 template) does not exist!"
+    echo "       Note, this error also happens, if the specified path refers to a link."
+    exit 1
+fi
+
+refhead="$refdir/inia19-t1"
+refbrain="$refdir/inia19-t1-brain"
+refmask="$refdir/inia19-t1-brainmask"
+
+P0="$refdir/inia19-prob_0"
+P1="$refdir/inia19-prob_1"
+P2="$refdir/inia19-prob_2"
+
+###########################################################
+## define some helper functions
+GetSlc(){
+    slices $1  -o tmpslc.gif
+    convert tmpslc.gif ${1}.png
+    rm tmpslc.gif
+}
+
+CompReg(){
+    slices  $1 $2 -o tmp_1to2.gif
+    convert tmp_1to2.gif tmp_1to2.gif.png
+
+    slices  $2 $1  -o tmp_2to1.gif
+    convert tmp_2to1.gif tmp_2to1.png
+
+    pngappend tmp_1to2.gif.png + 0  tmp_2to1.png $3
+    rm tmp_1to2.gif.png
+    rm tmp_2to1.png
+}
+
+###############################################
+# align and average images
+
+# file lists
+T1lst=$(ls $cNHP/$cwdir/T1w_*.nii.gz)
+T2lst=$(ls $cNHP/$cwdir/T2w_*.nii.gz)
+
+mk_studyref "$T1lst" -out $cNHP/$cwdir/T1_init -crop -iso 0.5 -nobet -nproc 4 -nIter 2
+GetSlc $cNHP/$cwdir/T1_init_mean
+imrm $cNHP/$cwdir/T1_init_mul
+imrm $cNHP/$cwdir/T1_init_sqr
+
+mk_studyref "$T2lst" -out $cNHP/$cwdir/T2_init -crop -iso 0.5 -nobet -nproc 4 -nIter 2
+GetSlc $cNHP/$cwdir/T2_init_mean
+imrm $cNHP/$cwdir/T2_init_mul
+imrm $cNHP/$cwdir/T2_init_sqr
+
+# extract brain in a rough way
+bet $cNHP/$cwdir/T1_init_mean $cNHP/$cwdir/T1_init_mean_brain -o -m -R -f 0.25 -r 30
+
+###############################################
+# co-register T1 images
+### co-register initial average to template brain
+flirt -in $cNHP/$cwdir/T1_init_mean_brain -ref $refbrain -bins 256 -cost normcorr -searchrx -10 10 -searchry -10 10 -searchrz -10 10 -dof 6  -interp trilinear -coarsesearch 12 -finesearch 3 -omat $cNHP/$cwdir/init2inria.mat
+
+# use the just obtained transformation to apply it to the head image
+flirt -in $cNHP/$cwdir/T1_init_mean -ref $refbrain -init $cNHP/$cwdir/init2inria.mat -out $cNHP/$cwdir/meanhead_2inia19 -applyxfm
+
+CompReg $cNHP/$cwdir/meanhead_2inia19 $refhead $cNHP/$cwdir/InitCoReg.png
+set_origin $cNHP/$cwdir/meanhead_2inia19 84 70 28 -o $cNHP/$cwdir/T1_meanhead_ebz
+
+# Co-register again with the stereo aligned head as reference
+mk_studyref "$NHP1_T1lst" -ref $cNHP/$cwdir/T1_meanhead_ebz -dof 6 -cost normcorr -ip spline -nIter 4 -out $cNHP/$cwdir/T1_meanhead -nproc 4 -iso 0.5 -thr 10 -rot_tol 10 -nobet
+
+immv $cNHP/$cwdir/T1_meanhead_mean $cNHP/$cwdir/T1_meanhead
+
+# co-register again to the reference image
+
+# extract brain first
+fnirtpars=" --warpres=4,4,4 --intmod=global_non_linear_with_bias --biasres=15,15,15 --subsamp=4,2,2,1 --reffwhm=4,2,2,1 --infwhm=4,2,2,1 --lambda=150,100,50,25 --miter=4,4,4,8 --estint=1,1,1,0 --applyrefmask=1,1,1,0 --applyinmask=1,1,1,0 --regmod=membrane_energy"
+
+bet $cNHP/$cwdir/T1_meanhead $cNHP/$cwdir/T1_meanhead_brain -o -m -R -f 0.25 -r 30
+
+flirt -in $cNHP/$cwdir/T1_meanhead_brain -ref $refbrain -out $cNHP/$cwdir/inia_ebz  -bins 256 -cost normcorr  -searchrx -10 10 -searchry -10 10 -searchrz -10 10 -dof 12  -interp trilinear -coarsesearch 12 -finesearch 3 -omat $cNHP/$cwdir/ebz2inia.mat
+
+CompReg $cNHP/$cwdir/inia_ebz $refbrain $cNHP/$cwdir/MeanCoReg.png
+
+# run fnirt
+fnirt --in=$cNHP/$cwdir/T1_meanhead --ref=$refhead --fout=$cNHP/$cwdir/EBZ_warpfield --iout=$cNHP/$cwdir/EBZ_warped --cout=$cNHP/$cwdir/EBZ_warpcoeff --aff=$cNHP/$cwdir/ebz2inia.mat $fnirtpars --refmask=$refmask --inmask=$cNHP/$cwdir/T1_meanhead_brain_mask
+
+invwarp --ref=$cNHP/$cwdir/T1_meanhead --warp=$cNHP/$cwdir/EBZ_warpfield --out=$cNHP/$cwdir/INIA_warpfield
+
+CompReg $cNHP/$cwdir/EBZ_warped $refhead $cNHP/$cwdir/FnirtCoReg.png
+
+# extract brain with the inia mask
+applywarp --ref=$cNHP/$cwdir/T1_meanhead --in=$refmask --out=$cNHP/$cwdir/inia_brainmask --warp=$cNHP/$cwdir/INIA_warpfield
+fslmaths $cNHP/$cwdir/inia_brainmask -thr 0.5 -bin $cNHP/$cwdir/brainmask -odt char
+fslmaths $cNHP/$cwdir/inia_brainmask -s 0.5 -thr 0.25 -bin $cNHP/$cwdir/brainmask_dil -odt char
+fslmaths $cNHP/$cwdir/T1_meanhead -mas $cNHP/$cwdir/brainmask_dil $cNHP/$cwdir/T1_brain
+
+###############################################
+# copy relevant files to the root directory
+
+imcp $cNHP/$cwdir/T1_meanhead    $cNHP/T1_head
+imcp $cNHP/$cwdir/T1_brain       $cNHP/T1_brain
+imcp $cNHP/$cwdir/brainmask      $cNHP/brainmask
+imcp $cNHP/$cwdir/brainmask_dil  $cNHP/brainmask_dil
+imcp $cNHP/$cwdir/INIA_warpfield $cNHP/From_INIA19_warpfield
+imcp $cNHP/$cwdir/EBZ_warpfield  $cNHP/To_INIA19_warpfield
+cp   $cNHP/$cwdir/ebz2inia.mat   $cNHP/T1_2_inia.mat
+convert_xfm  -omat $cNHP/inia_2_T1.mat -inverse $cNHP/T1_2_inia.mat
+
+###############################################
+###  Co-register now the T2 data
+T2lst=$(ls $cNHP/$cwdir/T2w_*.nii.gz)
+
+flirt -in $cNHP/$cwdir/T2_init_mean -ref $cNHP/T1_head -out $cNHP/$cwdir/T2_head_to_T1 -bins 256 -cost corratio  -searchry -10 10 -searchrz -10 10  -dof 6 -interp trilinear -coarsesearch 12 -finesearch 3 -omat $cNHP/$cwdir/T2init2T1.mat
+
+
+mk_studyref "$T2lst" -ref $cNHP/$cwdir/T2_head_to_T1 -out $cNHP/$cwdir/T2_head  -crop -nobet -nproc 4 -nIter 4
+imrm $cNHP/$cwdir/T2_mul
+imrm $cNHP/$cwdir/T2_sqr
+
+flirt -in $cNHP/$cwdir/T2_head_mean -ref $cNHP/T1_brain -out $cNHP/T2_head -bins 256 -cost corratio -nosearch -dof 6 -interp spline -coarsesearch 12 -finesearch 3 -omat $cNHP/$cwdir/T2_to_T1.mat
+
+fslmaths $cNHP/T2_head -mas $cNHP/brainmask_dil $cNHP/T2_brain
+
+CompReg $cNHP/T2_head $cNHP/T1_head $cNHP/$cwdir/T2_to_T1_CoReg.png
+
+###############################################
+## run segmentation
+
+# get first the tissue priors
+mkdir -p $cNHP/seg
+
+applywarp --ref=$cNHP/T1_head --in=$P0 --out=$cNHP/seg/inia_P0 --warp=$cNHP/From_INIA19_warpfield --interp=spline
+applywarp --ref=$cNHP/T1_head --in=$P1 --out=$cNHP/seg/inia_P1 --warp=$cNHP/From_INIA19_warpfield --interp=spline
+applywarp --ref=$cNHP/T1_head --in=$P2 --out=$cNHP/seg/inia_P2 --warp=$cNHP/From_INIA19_warpfield --interp=spline
+
+fast -S 2 -v -n 3 -R 0.2 -p -H 0.2 -f 0.075 -I 2 -l 2.5 -B -b -g -a $FSLDIR/etc/flirtsch/ident.mat -P -A $cNHP/seg/inia_P0 $cNHP/seg/inia_P1 $cNHP/seg/inia_P2 -o $cNHP/seg/Tissue $cNHP/T1_brain $cNHP/T2_brain
+
+vol_slicer $cNHP/T1_head -stat $cNHP/seg/Tissue_seg -trans -nomm -statrng 0.5 3 -out $cNHP/seg/Tissue_seg.png
+
+fslmaths $cNHP/seg/Tissue_seg_1 -add $cNHP/seg/Tissue_seg_2 -bin -fillh  $cNHP/BrainTissue -odt char
+fslmaths $cNHP/BrainTissue -s 2 -thr 0.25 -bin -fillh $cNHP/TissueMask -odt char
+
+fslmaths $cNHP/T1_head -mas $cNHP/TissueMask $cNHP/T1_Brain
+fslmaths $cNHP/T2_head -mas $cNHP/TissueMask $cNHP/T2_Brain
+
+###############################################
+## Determine skull
+fslmaths $cNHP/T1_head -s 1 -thrP 2 -fillh -bin $cNHP/seg/fullhead_mask -odt char
+fslmaths $cNHP/T1_head -mul $cNHP/T2_head   $cNHP/seg/T1timesT2_head
+fslmaths $cNHP/seg/T1timesT2_head  -add $cNHP/seg/fullhead_mask -roi 5 160 5 195 4 122 0 1 -ero -fillh -binv $cNHP/seg/OutHead -odt char
+fslmaths $cNHP/seg/OutHead -s 5 -thr 0.25 -bin $cNHP/seg/outterHeadmask -odt char
+fslmaths $cNHP/T1_head -thrP 20 -bin -add $cNHP/seg/outterHeadmask -binv -fillh $cNHP/BoneMask -odt char
+fslmaths $cNHP/seg/Tissue_seg -bin -s 2 -thr 0.25 -add $cNHP/BoneMask -bin -fillh  $cNHP/BoneBrain -odt char
+
+###############################################
+## Create a reference grid to validate scale
+
+mk_refgrid $cNHP/BoneMask $cNHP/ScaleGrid 35 100 30 120 20 60 -wd 4
+fslmaths $cNHP/ScaleGrid -roi 25 130 15 170 0 100 0 1 $cNHP/ScaleGrid
+imcp $cNHP/ScaleGrid $NHP2root/ScaleGrid
+
+fslmaths $cNHP/ScaleGrid -add $cNHP/BoneMask -bin $cNHP/BoxedSkull -odt char
+
+###############################################
+## up-sample data
+#     flirt -in $cNHP/T1_head -ref $cNHP/T1_head -o $cNHP/$cwdir/T1_head_025 -init $FSLDIR/etc/flirtsch/ident.mat -applyisoxfm 0.25
+#
+#     flirt -in $cNHP/T2_head -ref $cNHP/T1_head -o $cNHP/$cwdir/T2_head_025 -init $FSLDIR/etc/flirtsch/ident.mat -applyisoxfm 0.25
+#
+#     flirt -in $cNHP/TissueMask -ref $cNHP/T1_head -o $cNHP/brainmask_025 -init $FSLDIR/etc/flirtsch/ident.mat -applyisoxfm 0.25 -interp trilinear
+#     fslmaths $cNHP/brainmask_025 -thr 0.25 -bin $cNHP/brainmask_025 -odt char
+#
+#     mk_studyref "$NHP1_T1lst" -ref $cNHP/$cwdir/T1_head_025 -dof 6 -cost normcorr -ip spline -nIter 3 -out $cNHP/$cwdir/T1_head_025 -nproc 3  -thr 10 -rot_tol 10 -nobet
+#
+#     mk_studyref "$NHP1_T2lst" -ref $cNHP/$cwdir/T2_head_025 -dof 6 -cost normcorr -ip spline -nIter 3 -out $cNHP/$cwdir/T2_head_025 -nproc 3  -thr 10 -rot_tol 10 -nobet
+#
+#     imcp $cNHP/$cwdir/T1_head_025_mean $cNHP/T1_head_025
+flirt -in $cNHP/$cwdir/T2_head_025_mean -ref $cNHP/T1_head_025 -out $cNHP/T2_head_025 -bins 256 -cost corratio -nosearch -dof 6 -interp spline -coarsesearch 12 -finesearch 3 -inweight $cNHP/brainmask_025 -refweight $cNHP/brainmask_025 -init $FSLDIR/etc/flirtsch/ident.mat
+
+#     fslmaths $cNHP/T1_head_025 -mas $cNHP/brainmask_025 $cNHP/T1_brain_025
+fslmaths $cNHP/T2_head_025 -mas $cNHP/brainmask_025 $cNHP/T2_brain_025
+
+###############################################
+## segment again the up-sampled data
+
+# get the tissue priors into individual space
+applywarp --ref=$cNHP/T1_head_025 --in=$P0 --out=$cNHP/seg/inia_P0_025 --warp=$cNHP/From_INIA19_warpfield --interp=spline
+applywarp --ref=$cNHP/T1_head_025 --in=$P1 --out=$cNHP/seg/inia_P1_025 --warp=$cNHP/From_INIA19_warpfield --interp=spline
+applywarp --ref=$cNHP/T1_head_025 --in=$P2 --out=$cNHP/seg/inia_P2_025 --warp=$cNHP/From_INIA19_warpfield --interp=spline
+
+fast_options="-R 0.1 -p -H 0.1 -f 0.075 -I 4 -l 5 -B -b -g -P "
+# fast_options="-R 0.2 -p -H 0.2 -f 0.075 -I 2 -l 2.5 -B -b -g"
+# fast_options="-R 0.1 -p -H 0.1 -f 0.1 -I 4 -l 5 -B -b -g -W 25 --nopve"
+fast_options="-R 0.1 -p -H 0.1 -f 0.1 -I 4 -l 5 -B -b -g -W 10 -P"
+
+# run the segmentation
+fast -S 2 -v -n 3 $fast_options -a $FSLDIR/etc/flirtsch/ident.mat -A $cNHP/seg/inia_P0_025 $cNHP/seg/inia_P1_025 $cNHP/seg/inia_P2_025 -o $cNHP/seg/Tissue_025 $cNHP/T1_brain_025 $cNHP/T2_brain_025
+
+vol_slicer $cNHP/T1_head_025 -stat $cNHP/seg/Tissue_025_seg -trans -nomm -statrng 0.5 3 -out $cNHP/seg/Tissue_025_seg.png
+
+fslmaths $cNHP/seg/Tissue_025_seg_1 -add $cNHP/seg/Tissue_025_seg_2 -bin -fillh  $cNHP/BrainTissue_025 -odt char
+fslmaths $cNHP/BrainTissue_025 -s 2 -thr 0.25 -bin -fillh $cNHP/TissueMask_025 -odt char
+
+fslmaths $cNHP/T1_head_025 -mas $cNHP/TissueMask_025 $cNHP/T1_Brain_025
+fslmaths $cNHP/T2_head_025 -mas $cNHP/TissueMask_025 $cNHP/T2_Brain_025
+
+
+###############################################
+## Determine high resolution skull
+
+fslmaths $cNHP/T1_head_025 -s 1 -thrP 2 -fillh -bin $cNHP/seg/fullhead_025_mask -odt char
+fslmaths $cNHP/T1_head_025 -mul $cNHP/T2_head_025   $cNHP/seg/T1timesT2_head_025
+fslmaths $cNHP/seg/T1timesT2_head_025  -add $cNHP/seg/fullhead_025_mask -roi 5 325 10 395 10 242  0 1 -fillh -binv $cNHP/seg/OutHead_025 -odt char
+fslmaths $cNHP/seg/OutHead_025 -s 2 -thr 0.25 -bin $cNHP/seg/outterHeadmask_025 -odt char
+fslmaths $cNHP/T1_head_025 -thrP 20 -bin -add $cNHP/seg/outterHeadmask_025 -binv -fillh $cNHP/BoneMask_025 -odt char
+fslmaths $cNHP/seg/Tissue_025_seg -bin -s 2.5 -thr 0.25 -add $cNHP/BoneMask_025 -bin -fillh  $cNHP/BoneBrain_025 -odt char
+
+
+fslmaths $cNHP/BoneBrain_025 -mul 0 -add 1 -roi 0 336 0 412 55 2 0 1 -add $cNHP/BoneBrain_025 -bin -fillh -roi  0 336 0 412 58 195 0 1 $cNHP/BoneBrain_crop
+
+
+###############################################
+## Create a reference grid to validate scale
+
+# since both animals should be aligned in a similar space it is sufficient to create only one reference grid.
+mk_refgrid $cNHP/BoneMask_025 $cNHP/ScaleGrid_025 70 200 60 240 40 120 -wd 8
+fslmaths $cNHP/ScaleGrid_025 -roi 50 260 30 340 0 200 0 1 $cNHP/ScaleGrid_025 -odt char
+
+fslmaths $cNHP/ScaleGrid_025 -add $cNHP/BoneMask_025 -bin $cNHP/BoxedSkull_025 -odt char
+
+###############################################
+##### align head (T1_head_025) to EBZ using Mango - make sure that it is aligned well with the EZB plane.
+##### Resulting image is T1_head_025_ebz.
+
+echo "Use Mango to align volume to the EBZ plane. Save aligned image as 'T1_head_025_ebz.nii.gz'"
+mango T1_head_025.nii.gz
+
+read -p "Enter Zero point as 'X,Y,Z' (with comma and no space) : " origvxls
+
+orix_X=$(echo "$origvxls" | cut -d, -f1 )
+orix_Y=$(echo "$origvxls" | cut -d, -f2 )
+orix_Z=$(echo "$origvxls" | cut -d, -f3 )
+
+set_origin $cNHP/T1_head_025_ebz $orix_X $orix_Y $orix_Z
+
+# get flirt transformation matrix
+flirt -in $cNHP/T1_head_025 -ref $cNHP/T1_head_025_ebz -out $cNHP/T1_head_025_ebz -cost normcorr -omat $cNHP/T1_to_ebz.mat -interp spline -dof 6 -nosearch
+fslmaths $cNHP/T1_head_025_ebz -thrP 5 $cNHP/T1_head_025_ebz
+
+flirt -in $cNHP/T2_head_025 -ref $cNHP/T1_head_025_ebz -out $cNHP/T2_head_025_ebz -cost normcorr -interp spline -dof 6 -nosearch -coarsesearch 20 -finesearch 6
+fslmaths $cNHP/T2_head_025_ebz -thrP 5 $cNHP/T2_head_025_ebz
+
+flirt -in $cNHP/T2_head_025 -ref $cNHP/T1_head_025_ebz -out $cNHP/T2_head_025_ebz_aff -cost normcorr -interp spline -dof 12 -nosearch -coarsesearch 20 -finesearch 6
+fslmaths $cNHP/T2_head_025_ebz_aff -thrP 5 $cNHP/T2_head_025_ebz_aff
+
+# transform relevant data
+flirt -in $cNHP/BoneBrain_025 -ref $cNHP/T1_head_025_ebz -init $cNHP/T1_to_ebz.mat -applyxfm -interp trilinear -out $cNHP/BoneBrain_025_ebz
+fslmaths $cNHP/BoneBrain_025_ebz -thr 0.5 -bin $cNHP/BoneBrain_025_ebz -odt char
+
+# crop skull to EBZ
+
+fslview $cNHP/BoneBrain_025_ebz &
+
+read -p "Enter first and last X voxel that mark the border of the skull (X1,X2 - comma, no spaces) : " Xwd
+read -p "Enter first Y voxel and Y width that mark the border of the skull : " Ywd
+read -p "Enter first Z voxel and Z width that mark the border of the skull : " Zwd
+
+X1=$(echo "$Xwd" | cut -d, -f1 )
+X2=$(echo "$Xwd" | cut -d, -f2 )
+Xwd=$(echo "abs($X2 - $X1)" | bc -l)
+
+Y1=$(echo "$Ywd" | cut -d, -f1 )
+Y2=$(echo "$Ywd" | cut -d, -f2 )
+Ywd=$(echo "abs($Y2 - $Y1)" | bc -l)
+
+Z1=$(echo "$Zwd" | cut -d, -f1 )
+Z2=$(echo "$Zwd" | cut -d, -f2 )
+Zwd=$(echo "abs($Z2 - $Z1)" | bc -l)
+
+fslmaths $cNHP/BoneBrain_025_ebz                    -roi $X1 $Xwd $Y1 $Ywd $Z1 $Zwd 0 1      $cNHP/BoneBrain_025_ebz_crop
+fslmaths $cNHP/BoneBrain_025_ebz_crop -mul 0 -add 1 -roi $X1 $Xwd $Y1 $Ywd  0  $Z1  0 1 -add $cNHP/BoneBrain_025_ebz_crop \
+                                      -bin -fillh   -roi $X1 $Xwd $Y1 $Ywd $Z1 $Zwd 0 1      $cNHP/BoneBrain_025_ebz_crop
+# add a grid scale
+
+read -p "Enter first and last X voxel for the grid intersection (X1,X2 - comma, no spaces) : " Xgd
+read -p "Enter first and last Y voxel for the grid intersection : " Ygd
+read -p "Enter first and last Z voxel for the grid intersection : " Zgd
+
+X1g=$(echo "$Xgd" | cut -d, -f1 )
+X2g=$(echo "$Xgd" | cut -d, -f2 )
+Xwd=$(echo "abs($X2g - $X1g)" | bc -l)
+
+Y1g=$(echo "$Ygd" | cut -d, -f1 )
+Y2g=$(echo "$Ygd" | cut -d, -f2 )
+Ygd=$(echo "abs($Y2g - $Y1g)" | bc -l)
+
+Z1g=$(echo "$Zgd" | cut -d, -f1 )
+Z2g=$(echo "$Zgd" | cut -d, -f2 )
+Zgd=$(echo "abs($Z2g - $Z1g)" | bc -l)
+
+
+mk_refgrid $cNHP/BoneBrain_025_ebz_cropf $cNHP/ScaleGrid_025_ebz $X1g $Xgd $Y1g $Ygd $Z1g $Zgd -wd 8
+
+fslmaths $cNHP/ScaleGrid_025_ebz -roi $X1 $Xwd $Y1 $Ywd $Z1 $Zwd 0 1      $cNHP/ScaleGrid_025_ebz -odt char
+fslmaths $cNHP/ScaleGrid_025_ebz -roi $(($X1-10)) $(($Xwd+20)) $(($Y1-10)) $(($Ywd+20)) $Z1 $(($Zwd+10)) 0 1 -add $cNHP/BoneBrain_025_ebz_crop -bin $cNHP/BoxedBrain_025_ebz
+
+flirt -in $cNHP/T1_Brain_025 -ref $cNHP/T1_head_025_ebz -init $cNHP/T1_to_ebz.mat -applyxfm -interp trilinear -out $cNHP/T1_Brain_025_ebz
+
+flirt -in $cNHP/T2_Brain_025 -ref $cNHP/T1_head_025_ebz -init $cNHP/T1_to_ebz.mat -applyxfm -interp trilinear -out $cNHP/T2_brain_025_ebz
+
+flirt -in $cNHP/T2_head_025 -ref $cNHP/T1_head_025_ebz -init $cNHP/T1_to_ebz.mat -applyxfm -interp trilinear -out $cNHP/T2_head_025_ebz
+
+flirt -in $cNHP/TissueMask_025 -ref $cNHP/T1_head_025_ebz -init $cNHP/T1_to_ebz.mat -applyxfm -interp trilinear -out $cNHP/brainmask_025_ebz
+fslmaths $cNHP/brainmask_025_ebz -thr 0.5 -bin $cNHP/brainmask_025_ebz -odt char
+
+
+###############################################
+######  Skull reconstruction done here!  ######
+###############################################
+

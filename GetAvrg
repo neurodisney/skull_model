@@ -1,0 +1,196 @@
+#!/bin/bash
+#
+# GetAvrg
+#
+# created: 25.02.2015
+# by zinke
+#
+
+###################################################################################
+### This is an example script that was used to prepare the MRI data for getting ###
+### an average image and determining the skull bone                             ###
+###################################################################################
+
+# get the current path:
+rootpath="/DATA/E_tracks/Disney"
+
+
+NHP1="Schall_714222"
+NHP2="Disney_714293"
+
+NHP1root=$rootpath/$NHP1
+NHP2root=$rootpath/$NHP2
+
+NHPlst="$NHP1root $NHP2root"
+
+###########################################################
+## convert dicom files
+for cNHP in $NHPlst
+do
+    # create directory for the converted files
+    mkdir -p $cNHP/nifti
+
+    # convert to nifti (requires installation of MRIConvert)
+    mcverter -o $cNHP/nifti  -f fsl -q --nii --fourd  $cNHP/dicom
+
+    # zip them to save disk space
+    cd $cNHP/nifti
+    nii2gz
+    cd $rootpath
+done
+
+###########################################################
+## define some helper functions
+GetSlc(){
+    slices $1  -o tmpslc.gif
+    convert tmpslc.gif ${1}.png
+    rm tmpslc.gif
+}
+
+CompReg(){
+    slices  $1 $2 -o tmp_1to2.gif
+    convert tmp_1to2.gif tmp_1to2.gif.png
+
+    slices  $2 $1  -o tmp_2to1.gif
+    convert tmp_2to1.gif tmp_2to1.png
+
+    pngappend tmp_1to2.gif.png + 0  tmp_2to1.png $3
+    rm tmp_1to2.gif.png
+    rm tmp_2to1.png
+}
+
+###########################################################
+############# NHP 1 #############
+# start first with NHP1
+
+ppdir=$NHP1root/procs
+mkdir -p $ppdir # data for processing
+
+## prepare T1 images of first animal
+echo "T1 files for NHP1"
+ImgMod='T1w'
+
+ls $NHP1root/nifti/*.nii.gz | grep  _WIP_ | grep T1W
+
+scannum='4_1'
+fslroi $NHP1root/nifti/Schall_714222_20141216_471790578_401_WIP_sT1W_3D_TFE_SENSE_sT1W_3D_TFE  $ppdir/${ImgMod}_$scannum 65 170 90 110  0 180 0 1
+fslswapdim $ppdir/${ImgMod}_$scannum -z -x y  $ppdir/${ImgMod}_$scannum
+fslmaths $ppdir/${ImgMod}_$scannum -sub $(fslstats $ppdir/${ImgMod}_$scannum -P 15) -thr 0 -inm 5000  $ppdir/${ImgMod}_$scannum
+GetSlc $ppdir/${ImgMod}_$scannum
+
+scannum='4_3'
+fslroi $NHP1root/nifti/Schall_714222_20141216_471790578_403_VWIP_sT1W_3D_TFE_SENSE  $ppdir/${ImgMod}_$scannum 50 180 90 110 0 90 0 1
+fslswapdim $ppdir/${ImgMod}_$scannum x -z y   $ppdir/${ImgMod}_$scannum
+fslmaths $ppdir/${ImgMod}_$scannum -sub $(fslstats $ppdir/${ImgMod}_$scannum -P 15) -thr 0 -inm 5000  $ppdir/${ImgMod}_$scannum
+GetSlc $ppdir/${ImgMod}_$scannum
+
+scannum='4_4'
+fslroi $NHP1root/nifti/Schall_714222_20141216_471790578_404_VWIP_sT1W_3D_TFE_SENSE $ppdir/${ImgMod}_$scannum 50 200 60 170 0 60 0 1
+fslmaths $ppdir/${ImgMod}_$scannum -sub $(fslstats $ppdir/${ImgMod}_$scannum -P 15) -thr 0 -inm 5000  $ppdir/${ImgMod}_$scannum
+GetSlc $ppdir/${ImgMod}_$scannum
+
+T1lst=$(ls $NHP1root/nifti/*.nii.gz | grep 1_WIP_ | grep T1W_0)
+T1crop="100 280 110 240 40 134"
+
+for cfl in $T1lst
+do
+    scannum="$(basename $cfl | cut -d_ -f5 | rev | cut -c 3- | rev)_1"
+    fslroi $cfl $ppdir/${ImgMod}_$scannum $T1crop 0 1
+    fslmaths $ppdir/${ImgMod}_$scannum -sub $(fslstats $ppdir/${ImgMod}_$scannum -P 15) -thr 0 -inm 5000  $ppdir/${ImgMod}_$scannum
+
+    GetSlc $ppdir/${ImgMod}_$scannum
+done
+
+## prepare T2 images of first animal
+echo "T2 files for NHP1"
+ImgMod='T2w'
+
+T2lst=$(ls $NHP1root/nifti/*.nii.gz | grep  _WIP_ |  grep T2W)
+T2crop="470 990 490 900 20 134"
+
+for cfl in $T2lst
+do
+    scannum="$(basename $cfl | cut -d_ -f5 | rev | cut -c 3- | rev)_1"
+    fslroi $cfl $ppdir/${ImgMod}sm_$scannum $T2crop 0 1
+
+    fslmaths $ppdir/${ImgMod}sm_$scannum -s 0.2 $ppdir/${ImgMod}sm_$scannum
+
+    flirt -in $ppdir/${ImgMod}sm_$scannum -ref $ppdir/${ImgMod}sm_$scannum -init $FSLDIR/etc/flirtsch/ident.mat -applyisoxfm 0.25  -out $ppdir/${ImgMod}_$scannum -noresampblur # downsample files a bit
+
+    imrm $ppdir/${ImgMod}sm_$scannum # delete large file
+
+    fslmaths $ppdir/${ImgMod}_$scannum -sub $(fslstats $ppdir/${ImgMod}_$scannum -P 15) -thr 0 -inm 5000  $ppdir/${ImgMod}_$scannum
+
+    GetSlc $ppdir/${ImgMod}_$scannum
+done
+
+############# NHP 2 #############
+## then do NHP2
+NHP2root=$rootpath/$NHP2
+ppdir=$NHP2root/procs
+mkdir -p $ppdir # data for processing
+
+## prepare T1 images of first animal
+echo "T1 files for NHP2"
+ImgMod='T1w'
+ls $NHP2root/nifti/*.nii.gz | grep  _WIP_ | grep T1W
+
+scannum='3_1'
+fslroi $NHP2root/nifti/Disney_714293_20150107_473673770_301_WIP_sT1W_3D_TFE_SENSE_sT1W_3D_TFE  $ppdir/${ImgMod}_$scannum 65 170 115 110 2 148    0 1
+fslswapdim $ppdir/${ImgMod}_$scannum -z -x y  $ppdir/${ImgMod}_$scannum
+fslmaths $ppdir/${ImgMod}_$scannum -sub $(fslstats $ppdir/${ImgMod}_$scannum -P 15) -thr 0 -inm 5000  $ppdir/${ImgMod}_$scannum
+GetSlc $ppdir/${ImgMod}_$scannum
+
+scannum='4_1'
+fslroi $NHP2root/nifti/Disney_714293_20150107_473673770_401_WIP_sT1W_3D_TFE_SENSE_sT1W_3D_TFE  $ppdir/${ImgMod}_$scannum 60 180 100 110 5 140  0 1
+fslswapdim $ppdir/${ImgMod}_$scannum -z -x y  $ppdir/${ImgMod}_$scannum
+fslmaths $ppdir/${ImgMod}_$scannum -sub $(fslstats $ppdir/${ImgMod}_$scannum -P 15) -thr 0 -inm 5000  $ppdir/${ImgMod}_$scannum
+GetSlc $ppdir/${ImgMod}_$scannum
+
+scannum='7_1'
+fslroi $NHP2root/nifti/Disney_714293_20150107_473673770_701_WIP_sT1W_3D_TFE_TX_SENSE_sT1W_3D_TFE_TX $ppdir/${ImgMod}_$scannum 60 180 100 110 5 140  0 1
+fslswapdim $ppdir/${ImgMod}_$scannum -z -x y  $ppdir/${ImgMod}_$scannum
+fslmaths $ppdir/${ImgMod}_$scannum -sub $(fslstats $ppdir/${ImgMod}_$scannum -P 15) -thr 0 -inm 5000  $ppdir/${ImgMod}_$scannum
+GetSlc $ppdir/${ImgMod}_$scannum
+
+T1lst="Disney_714293_20150107_473673770_901_WIP_sT1W_TFE_TX_0o5_SENSE_sT1W_TFE_TX_0o5
+       Disney_714293_20150107_473673770_1201_WIP_sT1W_TFE_TX_0o5_SENSE_sT1W_TFE_TX_0o5
+       Disney_714293_20150107_473673770_1301_WIP_sT1W_TFE_TX_0o5_SENSE_sT1W_TFE_TX_0o5
+       Disney_714293_20150107_473673770_1401_WIP_sT1W_TFE_TX_0o5_SENSE_sT1W_TFE_TX_0o5"
+
+T1crop="75 250 135 150 10 200"
+
+for cfl in $T1lst
+do
+    scannum="$(basename $cfl | cut -d_ -f5 | rev | cut -c 3- | rev)_1"
+    fslroi $NHP2root/nifti/$cfl $ppdir/${ImgMod}_$scannum $T1crop 0 1
+    fslswapdim $ppdir/${ImgMod}_$scannum -z -x y  $ppdir/${ImgMod}_$scannum
+    fslmaths $ppdir/${ImgMod}_$scannum -sub $(fslstats $ppdir/${ImgMod}_$scannum -P 15) -thr 0 -inm 5000  $ppdir/${ImgMod}_$scannum
+
+    GetSlc $ppdir/${ImgMod}_$scannum
+done
+
+## prepare T2 images of second animal
+echo "T2 files for NHP2"
+ImgMod='T2w'
+
+scannum='10_1'
+fslroi $NHP2root/nifti/Disney_714293_20150107_473673770_1001_WIP_T2W_TSE_TX_0o5_SENSE_T2W_TSE_TX_0o5 $ppdir/${ImgMod}_$scannum 80 240 135 175 10 200  0 1
+fslswapdim $ppdir/${ImgMod}_$scannum -z -x y  $ppdir/${ImgMod}_$scannum
+fslmaths $ppdir/${ImgMod}_$scannum -sub $(fslstats $ppdir/${ImgMod}_$scannum -P 15) -thr 0 -inm 5000  $ppdir/${ImgMod}_$scannum
+GetSlc $ppdir/${ImgMod}_$scannum
+
+T2lst=$(ls $NHP2root/nifti/*.nii.gz |  grep T2_SHC)
+T2crop="80 240 105 160 10 200"
+
+for cfl in $T2lst
+do
+    scannum="$(basename $cfl | cut -d_ -f5 | rev | cut -c 3- | rev)_1"
+    fslroi $cfl $ppdir/${ImgMod}_$scannum $T2crop 0 1
+
+    fslswapdim $ppdir/${ImgMod}_$scannum -z -x y  $ppdir/${ImgMod}_$scannum
+
+    fslmaths $ppdir/${ImgMod}_$scannum -sub $(fslstats $ppdir/${ImgMod}_$scannum -P 15) -thr 0 -inm 5000  $ppdir/${ImgMod}_$scannum
+
+    GetSlc $ppdir/${ImgMod}_$scannum
+done
